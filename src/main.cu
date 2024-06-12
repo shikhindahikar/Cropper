@@ -10,26 +10,27 @@
 #define H_BUFF 1080
 
 // crops a portion of the input image using the top left corner coordinates and the width and height of the crop
-__global__ void cudacrop(int x, int y, int cropwidth, int cropheight, int inputpitch, int outputpitch, uint8_t* input, uint8_t* output) {
-    // Check if crop is within the input frame of UYVY format
-    if (x + cropwidth > W_BUFF || y + cropheight > H_BUFF) {
-        return;
-    }
-
+__global__ void cudacrop(int offsetX, int offsetY, int outWidth, int outHeight, uint8_t* input, uint8_t* output)
+{
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    int framesizeblocks = cropwidth * cropheight;
-
+    int framesizeblocks = (outWidth * outHeight) >> 1;
     for (int i = index; i < framesizeblocks; i += stride) {
-        int lineno = i / cropwidth;
-        int column = i % cropwidth;
-        int inputIndex = ((lineno + y) * inputpitch + (column + x) * 2);
-        int outputIndex = (lineno * outputpitch + column * 2);
-        
-        output[outputIndex] = input[inputIndex];
-        output[outputIndex + 1] = input[inputIndex + 1];
+        int lineno = (i << 1) / outWidth;
+        int column = (i << 1) % outWidth;
+        int block = (lineno * outWidth + column) << 1;
+        int inblock = ((lineno + offsetY) * W_BUFF + column + offsetX) << 1;
+        if (inblock < 0 || inblock >= W_BUFF * H_BUFF * 2) {
+            output[block] = 0;
+            output[block + 1] = 0;
+        } else {
+            output[block] = input[inblock];
+            output[block + 1] = input[inblock + 1];
+        }
     }
 }
+
+
 
 
 // Scales the input image to the output image
@@ -141,6 +142,11 @@ __global__ void cudalinearscale(int inwidth, int inheight, int inpitch, int outw
 }
 
 int main(int argc, char* argv[]) {
+    if (argc < 2) {
+        fprintf(stderr, "Usage: %s <video file>\n", argv[0]);
+        return 1;
+    }
+
     int cropWidth = 960;
     int cropHeight = 540;
     // Initialize SDL
@@ -151,90 +157,101 @@ int main(int argc, char* argv[]) {
 
     std::string video = argv[1];
 
-    // ffmpeg shit
+    // ffmpeg command
     std::string ffmpeg_path = "ffmpeg";
-
-    // command to run ffmpeg
 	std::string command = ffmpeg_path + " -i " + video + " -f image2pipe -pix_fmt uyvy422 -vcodec rawvideo -";
 	std::FILE* pipe = popen(command.c_str(), "r");
 	if (!pipe) {
-		throw std::runtime_error("Failed to open pipe");
+        fprintf(stderr, "Failed to open pipe\n");
+        SDL_Quit();
+        return 1;
 	}
-
-	void* raw_image = malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
 
     // Create a window
     SDL_Window *win = SDL_CreateWindow("Video Display", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, W_BUFF, H_BUFF, SDL_WINDOW_SHOWN);
-    if (win == NULL) {
+    if (!win) {
         fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
+        pclose(pipe);
         SDL_Quit();
         return 1;
     }
 
     // Create a renderer
     SDL_Renderer *renderer = SDL_CreateRenderer(win, -1, SDL_RENDERER_ACCELERATED | SDL_RENDERER_PRESENTVSYNC);
-    if (renderer == NULL) {
-        SDL_DestroyWindow(win);
+    if (!renderer) {
         fprintf(stderr, "SDL_CreateRenderer Error: %s\n", SDL_GetError());
+        SDL_DestroyWindow(win);
+        pclose(pipe);
         SDL_Quit();
         return 1;
     }
 
     // Create a texture for the raw video frame
     SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_UYVY, SDL_TEXTUREACCESS_STREAMING, W_BUFF, H_BUFF);
-    if (texture == NULL) {
+    if (!texture) {
+        fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
         SDL_DestroyRenderer(renderer);
         SDL_DestroyWindow(win);
-        fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
+        pclose(pipe);
+        SDL_Quit();
+        return 1;
+    }
+
+    int quit = 0;
+    SDL_Event e;
+    void* raw_image = malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
+    if (!raw_image) {
+        fprintf(stderr, "Failed to allocate memory\n");
+        SDL_DestroyTexture(texture);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(win);
+        pclose(pipe);
         SDL_Quit();
         return 1;
     }
 
     // CUDA init
-    uint8_t* d_input;
-    uint8_t* d_crop_input;
-    uint8_t* d_output;
-    uint8_t* output;
-
-    int quit = 0;
-    SDL_Event e;
-    while (!quit && fread(raw_image, H_BUFF * W_BUFF * 2, 1, pipe)) {
+    uint8_t *d_input, *d_output, *d_crop;
+    cudaMalloc(&d_input, H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
+    cudaMalloc(&d_output, H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
+    cudaMalloc(&d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t));
+    uint8_t *output = (uint8_t*)malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
+    if (!output) {
+        fprintf(stderr, "Failed to allocate memory\n");
+        free(raw_image);
+        free(output);
+        SDL_DestroyTexture(texture);
+        SDL_DestroyRenderer(renderer);
+        SDL_DestroyWindow(win);
+        pclose(pipe);
+        SDL_Quit();
+        return 1;
+    }
+    while (!quit && fread(raw_image, H_BUFF * W_BUFF * 2, 1, pipe) == 1) {
         while (SDL_PollEvent(&e) != 0) {
-            // User requests quit
-            if (e.type == SDL_QUIT) {
-                quit = true;
-            }
-            else if (e.type == SDL_KEYDOWN) {
-                // User presses a key
-                quit = true;
+            if (e.type == SDL_QUIT || e.type == SDL_KEYDOWN) {
+                quit = 1;
             }
         }
 
-        // Do CUDA shit here
-        cudaMalloc((void**)d_input, H_BUFF * W_BUFF * sizeof(uint8_t) * 2);
-        cudaMalloc((void**)d_output, H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
-        cudaMalloc((void**)d_crop_input, 960 * 540 * 2 * sizeof(uint8_t));
-        output = (uint8_t*)malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
-        cudaMemcpy(d_input, raw_image, H_BUFF * W_BUFF * sizeof(uint8_t) * 2, cudaMemcpyHostToDevice);
-        // Getting a crop from a frame into another frame
-        // Define block and grid dimensions for CUDA kernel launch
-        int blockSize = 256;
-        int numBlocks = (cropWidth * cropHeight + blockSize - 1) / blockSize;
-        fprintf(stderr, "Reached here!");
-        cudacrop<<<numBlocks, blockSize>>>(0, 0, cropWidth, cropHeight, W_BUFF * 2, cropWidth * 2, d_input, d_crop_input);
-        fprintf(stderr, "Passed this");
+        // CUDA stuff here
+        cudaMemcpy(d_input, raw_image, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyHostToDevice);
+        cudacrop<<<960, 256>>>(0, 0, cropWidth, cropHeight, d_input, d_crop);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA error in %s at line %d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err));
-            exit(EXIT_FAILURE);
+            fprintf(stderr, "CUDA error in cropping: %s\n", cudaGetErrorString(err));
+            break;
         }
-
-        // scaling the cropped frame to the original frame size
-        cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth * 2, W_BUFF, H_BUFF, W_BUFF * 2, d_crop_input, d_output);
-
+        cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth * 2, W_BUFF, H_BUFF, W_BUFF * 2, d_crop, d_output);
+        cudaError_t err2 = cudaGetLastError();
+        if (err2 != cudaSuccess) {
+            fprintf(stderr, "CUDA error scaling: %s\n", cudaGetErrorString(err2));
+            break;
+        }
         cudaMemcpy(output, d_output, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
         
         // Update the texture with the new frame data
+        // SDL_UpdateTexture(texture, NULL, raw_image, W_BUFF * 2);
         SDL_UpdateTexture(texture, NULL, output, W_BUFF * 2);
 
         // Clear the renderer
@@ -245,25 +262,15 @@ int main(int argc, char* argv[]) {
 
         // Present the renderer
         SDL_RenderPresent(renderer);
-
-        // Delay to simulate frame rate
-        SDL_Delay(33); // ~30 FPS
-
-        free(output);
-        cudaFree(d_input);
-        cudaFree(d_output);
-        cudaFree(d_crop_input);
     }
 
     // Clean up
     free(raw_image);
     free(output);
-    cudaFree(d_input);
-    cudaFree(d_output);
-    cudaFree(d_crop_input);
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(win);
+    pclose(pipe);
     SDL_Quit();
 
     return 0;
