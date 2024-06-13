@@ -1,23 +1,9 @@
-#include <SDL2/SDL.h>
-#include <stdint.h>
 #include <stdio.h>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <unistd.h>
-#include <string>
-#include <memory>
-// #include <nats/nats.h>
-#include <semaphore.h>
-
-
-#define W_BUFF 1920
-#define H_BUFF 1080
-
-#define NATS_SERVER "nats://localhost:4222"
+#include <crop.h>
 
 // Info to get from NATS
-int cropWidth = 1280;
-int cropHeight = 720;
+int cropWidth = W_BUFF;
+int cropHeight = H_BUFF;
 
 const char* sem_producer_name = "sem_producer";
 const char* sem_consumer_name = "sem_consumer";
@@ -165,12 +151,12 @@ __global__ void cudalinearscale(int inwidth, int inheight, int inpitch, int outw
 	}
 }
 
-// void call_back(natsConnection *conn, natsSubscription *sub, natsMsg *msg, void *closure) {
-//     printf("Received message: %s\n", natsMsg_GetData(msg));
-//     // parse the message and update the crop coordinates
-//     sscanf(natsMsg_GetData(msg), "%d %d %d %d", &x, &y, &cropWidth, &cropHeight);
-//     natsMsg_Destroy(msg);
-// }
+void call_back(natsConnection *conn, natsSubscription *sub, natsMsg *msg, void *closure) {
+    printf("Received message: %s\n", natsMsg_GetData(msg));
+    // parse the message and update the crop coordinates
+    sscanf(natsMsg_GetData(msg), "%d %d %d %d", &x, &y, &cropWidth, &cropHeight);
+    natsMsg_Destroy(msg);
+}
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -179,15 +165,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize NATS
-    // natsConnection *conn = NULL;
-    // natsConnection_ConnectTo(&conn, NATS_SERVER);
-    // if (conn == NULL) {
-    //     fprintf(stderr, "Failed to connect to NATS server\n");
-    //     return 1;
-    // }
+    natsConnection *conn = NULL;
+    natsConnection_ConnectTo(&conn, NATS_SERVER);
+    if (conn == NULL) {
+        fprintf(stderr, "Failed to connect to NATS server\n");
+        return 1;
+    }
 
-    // natsSubscription *sub = NULL;
-    // natsConnection_Subscribe(&sub, conn, "digital_PTZ.*", call_back, NULL);
+    natsSubscription *sub = NULL;
+    natsConnection_Subscribe(&sub, conn, "digital_PTZ.*", call_back, NULL);
 
     // Initialize SDL
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -306,26 +292,41 @@ int main(int argc, char* argv[]) {
         sem_wait(sem_producer);
 
         // CUDA stuff here
-        cudaMemcpy(d_input, shm_ptr, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyHostToDevice);
-        cudaMalloc(&d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t));
-        cudacrop<<<960, 256>>>(x, y, cropWidth, cropHeight, d_input, d_crop);
-        cudaError_t err = cudaGetLastError();
-        if (err != cudaSuccess) {
-            fprintf(stderr, "CUDA error in cropping: %s\n", cudaGetErrorString(err));
-            break;
-        }
-        cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth, W_BUFF, H_BUFF, W_BUFF, d_crop, d_output);
-        cudaError_t err2 = cudaGetLastError();
-        if (err2 != cudaSuccess) {
-            fprintf(stderr, "CUDA error scaling: %s\n", cudaGetErrorString(err2));
-            break;
-        }
-        cudaMemcpy(output, d_output, W_BUFF * H_BUFF * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
-        cudaFree(d_crop);
-        // Update the texture with the new frame data
-        // SDL_UpdateTexture(texture, NULL, raw_image, W_BUFF * 2);
-        SDL_UpdateTexture(texture, NULL, output, W_BUFF * 2);
+        if (cropWidth != W_BUFF && cropHeight != H_BUFF) {
+            cudaMemcpy(d_input, shm_ptr, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyHostToDevice);
+            cudaMalloc(&d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t));
+            
+            // Crop as per the coordinates and dimensions
+            cudacrop<<<960, 256>>>(x, y, cropWidth, cropHeight, d_input, d_crop);
+            cudaError_t err = cudaGetLastError();
+            if (err != cudaSuccess) {
+                fprintf(stderr, "CUDA error in cropping: %s\n", cudaGetErrorString(err));
+                break;
+            }
 
+            // Scale back to original resolution
+            cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth, W_BUFF, H_BUFF, W_BUFF, d_crop, d_output);
+            cudaError_t err2 = cudaGetLastError();
+            if (err2 != cudaSuccess) {
+                fprintf(stderr, "CUDA error scaling: %s\n", cudaGetErrorString(err2));
+                break;
+            }
+
+            cudaMemcpy(output, d_output, W_BUFF * H_BUFF * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+            cudaFree(d_crop);
+
+            // Update the texture with the new frame data
+            // SDL_UpdateTexture(texture, NULL, raw_image, W_BUFF * 2);
+            SDL_UpdateTexture(texture, NULL, output, W_BUFF * 2);
+
+            // resetting the crop dimensions
+            cropHeight = H_BUFF;
+            cropWidth = W_BUFF;
+        } 
+        else {
+            SDL_UpdateTexture(texture, NULL, shm_ptr, W_BUFF * 2);
+        }
+        
         // Clear the renderer
         SDL_RenderClear(renderer);
 
