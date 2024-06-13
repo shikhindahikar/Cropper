@@ -1,10 +1,13 @@
 #include <SDL2/SDL.h>
 #include <stdint.h>
 #include <stdio.h>
-#include <cstdlib>
+#include <fcntl.h>
+#include <sys/mman.h>
+#include <unistd.h>
 #include <string>
 #include <memory>
-#include <nats/nats.h>
+// #include <nats/nats.h>
+#include <semaphore.h>
 
 
 #define W_BUFF 1920
@@ -15,6 +18,9 @@
 // Info to get from NATS
 int cropWidth = 1280;
 int cropHeight = 720;
+
+const char* sem_producer_name = "sem_producer";
+const char* sem_consumer_name = "sem_consumer";
 
 int x = 0, y = 0;
 
@@ -159,12 +165,12 @@ __global__ void cudalinearscale(int inwidth, int inheight, int inpitch, int outw
 	}
 }
 
-void call_back(natsConnection *conn, natsSubscription *sub, natsMsg *msg, void *closure) {
-    printf("Received message: %s\n", natsMsg_GetData(msg));
-    // parse the message and update the crop coordinates
-    sscanf(natsMsg_GetData(msg), "%d %d %d %d", &x, &y, &cropWidth, &cropHeight);
-    natsMsg_Destroy(msg);
-}
+// void call_back(natsConnection *conn, natsSubscription *sub, natsMsg *msg, void *closure) {
+//     printf("Received message: %s\n", natsMsg_GetData(msg));
+//     // parse the message and update the crop coordinates
+//     sscanf(natsMsg_GetData(msg), "%d %d %d %d", &x, &y, &cropWidth, &cropHeight);
+//     natsMsg_Destroy(msg);
+// }
 
 int main(int argc, char* argv[]) {
     if (argc < 2) {
@@ -173,15 +179,15 @@ int main(int argc, char* argv[]) {
     }
 
     // Initialize NATS
-    natsConnection *conn = NULL;
-    natsConnection_ConnectTo(&conn, NATS_SERVER);
-    if (conn == NULL) {
-        fprintf(stderr, "Failed to connect to NATS server\n");
-        return 1;
-    }
+    // natsConnection *conn = NULL;
+    // natsConnection_ConnectTo(&conn, NATS_SERVER);
+    // if (conn == NULL) {
+    //     fprintf(stderr, "Failed to connect to NATS server\n");
+    //     return 1;
+    // }
 
-    natsSubscription *sub = NULL;
-    natsConnection_Subscribe(&sub, conn, "digital_PTZ.*", call_back, NULL);
+    // natsSubscription *sub = NULL;
+    // natsConnection_Subscribe(&sub, conn, "digital_PTZ.*", call_back, NULL);
 
     // Initialize SDL
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -200,6 +206,27 @@ int main(int argc, char* argv[]) {
         SDL_Quit();
         return 1;
 	}
+
+    // Create a shared memory object
+    const char* shm_name = "video_frames";
+    int shm_fd = shm_open(shm_name, O_CREAT | O_RDWR, 0666);
+    if (shm_fd == -1) {
+        perror("shm_open");
+        return -1;
+    }
+
+    // Set the size of the shared memory object
+    if (ftruncate(shm_fd, W_BUFF * H_BUFF * 2) == -1) {
+        perror("ftruncate");
+        return -1;
+    }
+
+    // Map the shared memory object
+    void* shm_ptr = mmap(0, W_BUFF * H_BUFF * 2, PROT_WRITE, MAP_SHARED, shm_fd, 0);
+    if (shm_ptr == MAP_FAILED) {
+        perror("mmap");
+        return -1;
+    }
 
     // Create a window
     SDL_Window *win = SDL_CreateWindow("Video Display", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, W_BUFF, H_BUFF, SDL_WINDOW_SHOWN);
@@ -233,16 +260,16 @@ int main(int argc, char* argv[]) {
 
     int quit = 0;
     SDL_Event e;
-    void* raw_image = malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
-    if (!raw_image) {
-        fprintf(stderr, "Failed to allocate memory\n");
-        SDL_DestroyTexture(texture);
-        SDL_DestroyRenderer(renderer);
-        SDL_DestroyWindow(win);
-        pclose(pipe);
-        SDL_Quit();
-        return 1;
-    }
+    // void* raw_image = malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
+    // if (!raw_image) {
+    //     fprintf(stderr, "Failed to allocate memory\n");
+    //     SDL_DestroyTexture(texture);
+    //     SDL_DestroyRenderer(renderer);
+    //     SDL_DestroyWindow(win);
+    //     pclose(pipe);
+    //     SDL_Quit();
+    //     return 1;
+    // }
 
     // CUDA init
     uint8_t *d_input, *d_output, *d_crop;
@@ -251,7 +278,7 @@ int main(int argc, char* argv[]) {
     uint8_t *output = (uint8_t*)malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
     if (!output) {
         fprintf(stderr, "Failed to allocate memory\n");
-        free(raw_image);
+        // free(raw_image);
         free(output);
         SDL_DestroyTexture(texture);
         SDL_DestroyRenderer(renderer);
@@ -260,15 +287,26 @@ int main(int argc, char* argv[]) {
         SDL_Quit();
         return 1;
     }
-    while (!quit && fread(raw_image, H_BUFF * W_BUFF * 2, 1, pipe) == 1) {
+
+    sem_t* sem_producer = sem_open(sem_producer_name, O_CREAT, 0666, 1);
+    sem_t* sem_consumer = sem_open(sem_consumer_name, O_CREAT, 0666, 0);
+
+    if (sem_producer == SEM_FAILED || sem_consumer == SEM_FAILED) {
+        perror("sem_open");
+        return -1;
+    }
+
+    while (!quit && fread(shm_ptr, H_BUFF * W_BUFF * 2, 1, pipe) == 1) {
         while (SDL_PollEvent(&e) != 0) {
             if (e.type == SDL_QUIT || e.type == SDL_KEYDOWN) {
                 quit = 1;
             }
         }
 
+        sem_wait(sem_producer);
+
         // CUDA stuff here
-        cudaMemcpy(d_input, raw_image, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_input, shm_ptr, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyHostToDevice);
         cudaMalloc(&d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t));
         cudacrop<<<960, 256>>>(x, y, cropWidth, cropHeight, d_input, d_crop);
         cudaError_t err = cudaGetLastError();
@@ -296,16 +334,29 @@ int main(int argc, char* argv[]) {
 
         // Present the renderer
         SDL_RenderPresent(renderer);
+
+        sem_post(sem_consumer);
     }
 
     // Clean up
-    free(raw_image);
+    // free(raw_image);
     free(output);
+    // SDL closing
     SDL_DestroyTexture(texture);
     SDL_DestroyRenderer(renderer);
     SDL_DestroyWindow(win);
-    pclose(pipe);
     SDL_Quit();
+    // closing the shared memory stuff
+    munmap(shm_ptr, W_BUFF * H_BUFF * 2);
+    close(shm_fd);
+    shm_unlink(shm_name);
+    // closing the semaphores
+    sem_close(sem_producer);
+    sem_close(sem_consumer);
+    sem_unlink(sem_producer_name);
+    sem_unlink(sem_consumer_name);
+    // closing the pipe
+    pclose(pipe);
 
     return 0;
 }
