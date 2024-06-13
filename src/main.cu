@@ -4,10 +4,19 @@
 #include <cstdlib>
 #include <string>
 #include <memory>
+#include <nats/nats.h>
 
 
 #define W_BUFF 1920
 #define H_BUFF 1080
+
+#define NATS_SERVER "nats://localhost:4222"
+
+// Info to get from NATS
+int cropWidth = 1280;
+int cropHeight = 720;
+
+int x = 0, y = 0;
 
 // crops a portion of the input image using the top left corner coordinates and the width and height of the crop
 // The width and height will always be in uniform factors of 3840x2160 resolution
@@ -15,7 +24,7 @@ __global__ void cudacrop(int offsetX, int offsetY, int outWidth, int outHeight, 
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    int framesizeblocks = (outWidth * outHeight);
+    int framesizeblocks = (outWidth * outHeight) >> 1;
 
     for (int i = index; i < framesizeblocks; i += stride) {
         // Calculate the line number and column for the current pixel
@@ -150,16 +159,29 @@ __global__ void cudalinearscale(int inwidth, int inheight, int inpitch, int outw
 	}
 }
 
+void call_back(natsConnection *conn, natsSubscription *sub, natsMsg *msg, void *closure) {
+    printf("Received message: %s\n", natsMsg_GetData(msg));
+    // parse the message and update the crop coordinates
+    sscanf(natsMsg_GetData(msg), "%d %d %d %d", &x, &y, &cropWidth, &cropHeight);
+    natsMsg_Destroy(msg);
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 2) {
         fprintf(stderr, "Usage: %s <video file>\n", argv[0]);
         return 1;
     }
 
-    int cropWidth = 960;
-    int cropHeight = 540;
+    // Initialize NATS
+    natsConnection *conn = NULL;
+    natsConnection_ConnectTo(&conn, NATS_SERVER);
+    if (conn == NULL) {
+        fprintf(stderr, "Failed to connect to NATS server\n");
+        return 1;
+    }
 
-    int x = 0, y = 0;
+    natsSubscription *sub = NULL;
+    natsConnection_Subscribe(&sub, conn, "digital_PTZ.*", call_back, NULL);
 
     // Initialize SDL
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
@@ -180,7 +202,7 @@ int main(int argc, char* argv[]) {
 	}
 
     // Create a window
-    SDL_Window *win = SDL_CreateWindow("Video Display", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, cropWidth, cropHeight, SDL_WINDOW_SHOWN);
+    SDL_Window *win = SDL_CreateWindow("Video Display", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, W_BUFF, H_BUFF, SDL_WINDOW_SHOWN);
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
         pclose(pipe);
@@ -199,7 +221,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Create a texture for the raw video frame
-    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_UYVY, SDL_TEXTUREACCESS_STREAMING, cropWidth, cropHeight);
+    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_UYVY, SDL_TEXTUREACCESS_STREAMING, W_BUFF, H_BUFF);
     if (!texture) {
         fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
         SDL_DestroyRenderer(renderer);
@@ -254,17 +276,17 @@ int main(int argc, char* argv[]) {
             fprintf(stderr, "CUDA error in cropping: %s\n", cudaGetErrorString(err));
             break;
         }
-        // cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth * 2, W_BUFF, H_BUFF, W_BUFF * 2, d_crop, d_output);
+        cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth, W_BUFF, H_BUFF, W_BUFF, d_crop, d_output);
         cudaError_t err2 = cudaGetLastError();
         if (err2 != cudaSuccess) {
             fprintf(stderr, "CUDA error scaling: %s\n", cudaGetErrorString(err2));
             break;
         }
-        cudaMemcpy(output, d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        cudaMemcpy(output, d_output, W_BUFF * H_BUFF * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
         cudaFree(d_crop);
         // Update the texture with the new frame data
         // SDL_UpdateTexture(texture, NULL, raw_image, W_BUFF * 2);
-        SDL_UpdateTexture(texture, NULL, output, cropWidth * 2);
+        SDL_UpdateTexture(texture, NULL, output, W_BUFF * 2);
 
         // Clear the renderer
         SDL_RenderClear(renderer);
