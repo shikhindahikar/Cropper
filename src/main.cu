@@ -15,20 +15,29 @@ __global__ void cudacrop(int offsetX, int offsetY, int outWidth, int outHeight, 
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    int framesizeblocks = (outWidth * outHeight) ;
+    int framesizeblocks = (outWidth * outHeight);
+
     for (int i = index; i < framesizeblocks; i += stride) {
-        // altering this will mess with the arrangement of the pixels
+        // Calculate the line number and column for the current pixel
         int lineno = (i << 1) / outWidth;
         int column = (i << 1) % outWidth;
-        int block = (lineno * outWidth + column);
-        // altering this will mess with colours
-        if (lineno + offsetY < H_BUFF && column + offsetX < W_BUFF) {
-            int inblock = ((lineno + offsetY) * W_BUFF + (column + offsetX));
-            output[block] = input[inblock];
-            output[block + 1] = input[inblock + 1];
+
+        // Calculate the linear index for the output buffer
+        int outIndex = lineno * outWidth + column;
+
+        // Calculate the corresponding linear index for the input buffer
+        int inRow = lineno + offsetY;
+        int inCol = column + offsetX;
+        int inIndex = inRow * W_BUFF + inCol;
+
+        // Copy the pixel data from input to output buffer
+        if (inRow < H_BUFF && inCol < W_BUFF) {
+            // Copy the pixel data from input to output buffer
+            ((uint32_t*)output)[outIndex >> 1] = ((uint32_t*)input)[inIndex >> 1];
         }
     }
 }
+
 
 
 
