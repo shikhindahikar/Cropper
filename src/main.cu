@@ -10,20 +10,20 @@
 #define H_BUFF 1080
 
 // crops a portion of the input image using the top left corner coordinates and the width and height of the crop
+// The width and height will always be in uniform factors of 3840x2160 resolution
 __global__ void cudacrop(int offsetX, int offsetY, int outWidth, int outHeight, uint8_t* input, uint8_t* output)
 {
     int index = blockIdx.x * blockDim.x + threadIdx.x;
     int stride = blockDim.x * gridDim.x;
-    int framesizeblocks = (outWidth * outHeight) >> 1;
+    int framesizeblocks = (outWidth * outHeight) ;
     for (int i = index; i < framesizeblocks; i += stride) {
+        // altering this will mess with the arrangement of the pixels
         int lineno = (i << 1) / outWidth;
         int column = (i << 1) % outWidth;
-        int block = (lineno * outWidth + column) << 1;
-        int inblock = ((lineno + offsetY) * W_BUFF + column + offsetX) << 1;
-        if (inblock < 0 || inblock >= W_BUFF * H_BUFF * 2) {
-            output[block] = 0;
-            output[block + 1] = 0;
-        } else {
+        int block = (lineno * outWidth + column);
+        // altering this will mess with colours
+        if (lineno + offsetY < H_BUFF && column + offsetX < W_BUFF) {
+            int inblock = ((lineno + offsetY) * W_BUFF + (column + offsetX));
             output[block] = input[inblock];
             output[block + 1] = input[inblock + 1];
         }
@@ -149,6 +149,9 @@ int main(int argc, char* argv[]) {
 
     int cropWidth = 960;
     int cropHeight = 540;
+
+    int x = 0, y = 0;
+
     // Initialize SDL
     if (SDL_Init(SDL_INIT_VIDEO) != 0) {
         fprintf(stderr, "SDL_Init Error: %s\n", SDL_GetError());
@@ -168,7 +171,7 @@ int main(int argc, char* argv[]) {
 	}
 
     // Create a window
-    SDL_Window *win = SDL_CreateWindow("Video Display", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, W_BUFF, H_BUFF, SDL_WINDOW_SHOWN);
+    SDL_Window *win = SDL_CreateWindow("Video Display", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED, cropWidth, cropHeight, SDL_WINDOW_SHOWN);
     if (!win) {
         fprintf(stderr, "SDL_CreateWindow Error: %s\n", SDL_GetError());
         pclose(pipe);
@@ -187,7 +190,7 @@ int main(int argc, char* argv[]) {
     }
 
     // Create a texture for the raw video frame
-    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_UYVY, SDL_TEXTUREACCESS_STREAMING, W_BUFF, H_BUFF);
+    SDL_Texture *texture = SDL_CreateTexture(renderer, SDL_PIXELFORMAT_UYVY, SDL_TEXTUREACCESS_STREAMING, cropWidth, cropHeight);
     if (!texture) {
         fprintf(stderr, "SDL_CreateTexture Error: %s\n", SDL_GetError());
         SDL_DestroyRenderer(renderer);
@@ -214,7 +217,6 @@ int main(int argc, char* argv[]) {
     uint8_t *d_input, *d_output, *d_crop;
     cudaMalloc(&d_input, H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
     cudaMalloc(&d_output, H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
-    cudaMalloc(&d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t));
     uint8_t *output = (uint8_t*)malloc(H_BUFF * W_BUFF * 2 * sizeof(uint8_t));
     if (!output) {
         fprintf(stderr, "Failed to allocate memory\n");
@@ -236,23 +238,24 @@ int main(int argc, char* argv[]) {
 
         // CUDA stuff here
         cudaMemcpy(d_input, raw_image, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyHostToDevice);
-        cudacrop<<<960, 256>>>(0, 0, cropWidth, cropHeight, d_input, d_crop);
+        cudaMalloc(&d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t));
+        cudacrop<<<960, 256>>>(x, y, cropWidth, cropHeight, d_input, d_crop);
         cudaError_t err = cudaGetLastError();
         if (err != cudaSuccess) {
             fprintf(stderr, "CUDA error in cropping: %s\n", cudaGetErrorString(err));
             break;
         }
-        cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth * 2, W_BUFF, H_BUFF, W_BUFF * 2, d_crop, d_output);
+        // cudalinearscale<<<960, 256>>>(cropWidth, cropHeight, cropWidth * 2, W_BUFF, H_BUFF, W_BUFF * 2, d_crop, d_output);
         cudaError_t err2 = cudaGetLastError();
         if (err2 != cudaSuccess) {
             fprintf(stderr, "CUDA error scaling: %s\n", cudaGetErrorString(err2));
             break;
         }
-        cudaMemcpy(output, d_output, H_BUFF * W_BUFF * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
-        
+        cudaMemcpy(output, d_crop, cropWidth * cropHeight * 2 * sizeof(uint8_t), cudaMemcpyDeviceToHost);
+        cudaFree(d_crop);
         // Update the texture with the new frame data
         // SDL_UpdateTexture(texture, NULL, raw_image, W_BUFF * 2);
-        SDL_UpdateTexture(texture, NULL, output, W_BUFF * 2);
+        SDL_UpdateTexture(texture, NULL, output, cropWidth * 2);
 
         // Clear the renderer
         SDL_RenderClear(renderer);
